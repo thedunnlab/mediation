@@ -1,0 +1,573 @@
+---
+title: "Generation R Descriptive Analyses - Measuring Adversity"
+author: "Yiwen Zhu"
+date: "4/8/2019"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_depth: 4
+    fig_caption: true
+---
+
+<style>
+   body .main-container {
+       max-width: 1200px;
+   }
+</style>
+
+This script allows us to run a few preliminary analyses and the results will inform decisions about how the adversity measures should be modeled in subsequent analyses. 
+
+
+```{r, message=FALSE, echo=FALSE, warning=FALSE}
+## packages 
+library(dplyr) # for data wrangling 
+library(knitr) # for data wrangling 
+library(visdat) # for visualizing missingness
+library(tableone) # for producing summary statistics
+library(psych) # for tetrachoric correlations 
+library(ggcorrplot) # for generating a correlation heatmap
+library(tidyr)
+library(ggplot2)
+library(gridExtra)
+
+# a function that lets you rename the object loaded 
+loadRData <- function(fileName){
+  #loads an RData file, and returns it
+  load(fileName)
+  get(ls()[ls() != "fileName"])
+}
+## load data 
+## Alex: please replace the scrambled data with the real dataset containing everyone with DNAm at age 10 (N=)
+genr <- loadRData("genr_id.Rdata")
+```
+
+## Part 1: Calculating sample sizes and recoding variables as binary measures
+
+In the first part, we would like to see how big the sample would be if we restricted it to participants with available data on the exposure and covariates, calculated separately for each type of exposure. 
+
+### Covariates 
+First we consider those with complete data on all covariates.
+The analyses have to be restricted to those with complete data on all covariates. 
+Covariates we are hoping to include: baseline maternal education, child race/ethnicity, sex, mother's age at birth, number of previous pregnancies, birth weight, maternal smoking during pregnancy
+Additional covariates: cell counts (Houseman);these can be derived directly from DNAm data. 
+
+(ALSPAC cell counts: "CD8", "CD4", "CD56", "CD19", "CD14", "Gran")
+
+```{r, fig.width=10}
+covariates <- c("EDUCM", "ETHNINFv2", "GENDER", "agemother_birthchild", "RANKCHILD", "WEIGHT", "msmoke")
+
+
+## generate a plot for missingness 
+vis_miss(genr[, covariates], cluster = TRUE, sort_miss = TRUE)
+
+## create a subset of data with complete covariate information
+genr.covar <- genr %>% filter_at(vars(covariates), all_vars(!is.na(.)))
+print(paste0("Number of subjects with complete covariate data: ", nrow(genr.covar)))
+
+```
+
+
+
+```{r}
+## recode covariates
+genr.covar <- genr.covar %>% 
+  mutate(EDUCM_collapsed = case_when(as.numeric(EDUCM) <= 4 ~ "no college", 
+                                     as.numeric(EDUCM) == 5 ~ "higher phase 1", 
+                                     as.numeric(EDUCM) == 6 ~ "higher phase 2"), ## maternal education
+         Dutch = case_when(ETHNINFv2 == "Dutch" ~ "Dutch", 
+                           TRUE ~ "Non-Dutch"), ## ethnicity; no missingness here 
+         agemother_birthchild_cat = case_when(agemother_birthchild <= 19 ~ "under 19",
+                                  agemother_birthchild > 19 & agemother_birthchild <= 35 ~ "20-35",
+                                  agemother_birthchild > 35 ~ "above 35"), 
+         ## categorical birth weight for descriptives
+         birthweight_cat = case_when(WEIGHT < 3000 ~ "<3000", 
+                                     WEIGHT >= 3000 & WEIGHT < 3500 ~ "3000-3499",
+                                     WEIGHT >= 3500 & WEIGHT < 4000 ~ "3500-3900", 
+                                     WEIGHT >= 4000 ~ ">=4000"))  %>%  
+        ## order those factors
+        mutate(EDUCM_collapsed = factor(EDUCM_collapsed, levels = c("no college", "higher phase 1", "higher phase 2")), 
+               agemother_birthchild_cat = factor(agemother_birthchild_cat, levels = c("under 19", "20-35", "above 35")), 
+               birthweight_cat = factor(birthweight_cat, levels = c("<3000", "3000-3499", "3500-3900", ">=4000")))
+
+
+covariates <- c("EDUCM_collapsed", "Dutch", "GENDER", "agemother_birthchild_cat", "RANKCHILD", "birthweight_cat", "msmoke")
+
+## create a descriptive table for the covariates 
+covar.desc <- CreateTableOne(vars = covariates, factorVars = c("EDUCM_collapsed","Dutch","GENDER", "RANKCHILD", "msmoke", "agemother_birthchild_cat"), data = genr.covar)
+print(covar.desc, showAllLevels = TRUE)
+
+```
+
+
+### Maternal psychopathology 
+
+We are considering defining the exposure to maternal psychopathology as having a score that meets the "Dutch cut-off" on either of the two subscales (depression or anxiety). Note that we are choosing the two subscales because they are available at more time points (whereas the global score was avaialable at selective time points). 
+
+We could use the 6 months measure to impute the 2 months measure, as Henning suggested. Then we calculate the sample size for those with complete data at all time points. 
+
+```{r}
+## 2 months: DEP_M2, ANX_M2
+## 6 months: ANX_M6, DEP_M6
+## 3 years: anx_M36_m, dep_M36_m
+## 10 years: anx_M108_m, dep_M108_m
+
+mompsy.vars <- c("DEP_M2", "ANX_M2", "ANX_M6", "DEP_M6", "anx_M36_m", 
+                 "dep_M36_m", "anx_M108_m", "dep_M108_m")
+## generate a plot for missingness among those with complete covariate data
+vis_miss(genr.covar[, mompsy.vars], cluster = TRUE)
+
+## Among those with complete covariate data, how many individuals had both 2-month and 6-month measures
+n.both <- genr.covar %>% filter_at(vars("DEP_M2", "ANX_M2", "ANX_M6", "DEP_M6"), all_vars(!is.na(.))) %>% nrow(.)
+print(paste0("Number of subjects with complete covariate data and both 2-month and 6-month assessments: ", n.both))
+
+## taking the higher level out of the two measures 
+genr.covar <- genr.covar %>% mutate(DEP_pp = pmax(DEP_M2, DEP_M6, na.rm = T), 
+  ANX_pp =  pmax(ANX_M2, ANX_M6, na.rm = T))
+
+mompsy.vars <- c("DEP_pp", "ANX_pp", "anx_M36_m", "dep_M36_m", "anx_M108_m", "dep_M108_m")
+## calculate sample size
+n.mompsy <- genr.covar %>% filter_at(vars(mompsy.vars), all_vars(!is.na(.))) %>% nrow(.) 
+
+print(paste0("Number of subjects with complete covariate data and maternal psychopathology: ", n.mompsy))
+
+## creating binary measures based on the Dutch-cutoffs, i.e., > 0.71 
+
+genr.covar <- genr.covar %>% mutate(mompsych_pp = case_when((DEP_pp > 0.71 | ANX_pp > 0.71) ~ 1, 
+                                                            (DEP_pp <= 0.71 & ANX_pp <= 0.71) ~ 0), 
+                                    mompsych_3y = case_when((dep_M36_m > 0.71 | anx_M36_m > 0.71) ~ 1, 
+                                                            (dep_M36_m <= 0.71 & anx_M36_m <= 0.71) ~ 0),
+                                    mompsych_10y = case_when((dep_M108_m > 0.71 | anx_M108_m > 0.71) ~ 1, 
+                                                            (dep_M108_m <= 0.71 & anx_M108_m <= 0.71) ~ 0))
+```
+
+
+### Poverty/financial hardship 
+
+"“Have you had difficulty paying the rent, electricity bills, food and suchlike during the past year on your income?” 
+
+Time points: 2 years, 3 years, 10 years
+
+The item was rated on a 3-point scale: no trouble, a little trouble, and a lot of trouble.
+
+If the subject responded "a little" or "a lot" then they are coded as exposed 
+
+
+```{r} 
+## 2-3 yr: G0700132
+## 3 yr: G0600165
+## 10 yr: E0600181_v2
+
+## rename to be more informative
+genr.covar <- genr.covar %>% rename(fscore_2y = G0700132, 
+                                    fscore_3y = G0600165,
+                                    fscore_10y = E0600181_v2)
+
+
+## list of variable names at each time point 
+fscore.vars <- c("fscore_2y", "fscore_3y", "fscore_10y")
+## generate a plot for missingness among those with complete covariate data
+vis_miss(genr.covar[, fscore.vars], cluster = TRUE)
+
+## calculate sample size
+n.fscore <- genr.covar %>% filter_at(vars(fscore.vars), all_vars(!is.na(.))) %>% nrow(.) 
+
+print(paste0("Number of subjects with complete covariate data and financial hardship: ", n.fscore))
+
+## coding the fscore items as dichotomous variables
+# table(genr.covar$fscore_2y)
+# table(as.numeric(genr.covar$fscore_2y))
+genr.covar <- genr.covar %>% mutate(fscore_2y = case_when(as.numeric(fscore_2y) > 1 ~ 1,
+                                                          as.numeric(fscore_2y) == 1 ~ 0),
+                                    fscore_3y = case_when(as.numeric(fscore_3y) > 1 ~ 1,
+                                                          as.numeric(fscore_3y) == 1 ~ 0), 
+                                    fscore_10y = case_when(as.numeric(fscore_10y) > 1 ~ 1,
+                                                          as.numeric(fscore_10y) == 1 ~ 0))
+```
+
+### One adult in the household 
+
+There's one item asking how many adults were in the household and if the biological father lived in the household, at 2 months, 6 months, and 6 years. Similar to maternal psychopathology above, we will collapse the 2 months and 6 months measures into a postpartum measure. 
+
+
+
+```{r}
+## 2 months: C0600119, C0600219
+## 6 months: D0600124, D0600224
+## 6 years: B0300175_1_clean, B0300175_2_clean, B0300575_clean, B0300675_clean
+
+## rename to be more informative, and recode
+## if the biological father resides in the household OR there are other adults living in the household 
+## then coded as 0; if both are false, 0
+
+## note: I'm not sure what the original data types were 
+## assuming for those asking about the biological father, 1 = yes, 0 = no
+## for those asking about number of other adults in the household, integer 
+
+genr.covar <- genr.covar %>% mutate(oneadult_2m = 
+                                      case_when((C0600119 == "Yes" | C0600219 == "Yes") ~ 0,
+                                                (C0600119 == "No" | C0600219 == "No") ~ 1),
+                                    oneadult_6m =             
+                                      case_when((D0600124 == "yes" | D0600224 != "no") ~ 0,
+                                                (D0600124 == "no" | D0600224 == "no") ~ 1)) %>% rowwise() %>%
+mutate(oneadult_6y =
+                                   case_when(
+                                   sum(as.numeric(B0300175_1_clean), as.numeric(B0300175_2_clean), as.numeric(B0300575_clean), as.numeric(B0300675_clean), na.rm = T) > 1 ~ 0,
+                                   sum(as.numeric(B0300175_1_clean), as.numeric(B0300175_2_clean), as.numeric(B0300575_clean), as.numeric(B0300675_clean), na.rm = T) == 0 ~ 1))
+
+
+
+## Among those with complete covariate data, how many individuals had both 2-month and 6-month measures
+n.both <- genr.covar %>% filter_at(vars("oneadult_2m", "oneadult_6m"), all_vars(!is.na(.))) %>% nrow(.)
+print(paste0("Number of subjects with complete covariate data and both 2-month and 6-month assessments: ", n.both))
+
+## collapsing 2m and 6m; if ever exposed during those two time points, exposed
+genr.covar <- genr.covar %>% mutate(oneadult_pp = pmax(oneadult_2m, oneadult_6m, na.rm = T))
+
+
+## list of variable names at each time point 
+oneadult.vars <- c("oneadult_pp", "oneadult_6y")
+## generate a plot for missingness among those with complete covariate data
+vis_miss(genr.covar[, oneadult.vars], cluster = TRUE)
+
+## calculate sample size
+n.oneadult <- genr.covar %>% filter_at(vars(oneadult.vars), all_vars(!is.na(.))) %>% nrow(.) 
+
+print(paste0("Number of subjects with complete covariate data and one adult in the household: ", n.oneadult))
+```
+
+### Family instability 
+```{r}
+
+## can use the family separation items directly coded by Xerxa et al. (2019)
+## should we incorporate the family conflict items as well? pending 
+
+genr.covar <- genr.covar %>% mutate(faminst_3y = 
+                                      case_when(separation_3yrs == "partner" ~ 0, 
+                                                separation_3yrs == "no partner" ~ 1), 
+                                    faminst_6y = 
+                                      case_when(separation_3_5yrs == "partner" ~ 0, 
+                                                separation_3_5yrs == "no partner" ~ 1), 
+                                    faminst_10y = 
+                                      case_when(separation_5_9yrs == "partner" ~ 0, 
+                                                separation_5_9yrs == "no partner" ~ 1))
+
+faminst.vars <- c("faminst_3y", "faminst_6y", "faminst_10y")
+n.faminst <- genr.covar %>%filter_at(vars(faminst.vars), all_vars(!is.na(.))) %>% nrow(.)
+
+print(paste0("Number of subjects with complete covariate data and family instability (separation): ", n.faminst))
+```
+
+
+### Caregiver physical or emotional abuse 
+
+```{r, fig.width=20, fig.height=10}
+## age 3, Conflict Tactics Scale, harsh parenting 
+cts.items <- c("F0100465", "F0100565", "F0100665", "F0100765", "F0100965", "F0101065")
+
+## F0100465 Numeric 3 0 F1-d I gave him/her a good shake
+## F0100565 Numeric 3 0 F1-e I shouted or screamed angrily
+## F0100665 Numeric 3 0 F1-f I called him/her names
+## F0100765 Numeric 3 0 F1-g I threatened to give him/her a slap but didn’t
+## F0100965 Numeric 3 0 F1-i I pinched his/her
+## F0101065 Numeric 3 0 F1-j I called him/her stupid or lazy or something
+
+
+
+## age 8, Alabama parenting questionnaire
+## D0203380_cleaned Numeric 8 2 GR1080 D2-33 You spank your child with your hand when he/she has done something wrong
+## D0203580_cleaned Numeric 8 2 GR1080 D2-35 You slap your child when he/she does something wrong
+## D0203880_cleaned Numeric 8 2 GR1080 D2-38 You yell or scream at your child when he/she does something wrong
+
+apq.items <- c("D0203380_cleaned", "D0203580_cleaned", "D0203880_cleaned")
+
+## examining item level prevalence 
+parcruel.tbl <- tableone::CreateCatTable(vars = c(cts.items, apq.items), data = genr.covar)
+print(parcruel.tbl)
+
+cts.exposed <- case_when(as.numeric(genr.covar$F0100465) >= 2 ~ 1,
+                         as.numeric(genr.covar$F0100965) >= 2 ~ 1, 
+                         # as.numeric(genr.covar$F0100565) >= 4 ~ 1, 
+                          as.numeric(genr.covar$F0100665) >= 3 ~ 1, 
+                          as.numeric(genr.covar$F0100765) >= 4 ~ 1, 
+                          as.numeric(genr.covar$F0101065) >= 3 ~ 1, 
+                         as.numeric(genr.covar$F0100465) < 2 & 
+                           as.numeric(genr.covar$F0100965) < 2 & 
+                            # as.numeric(genr.covar$F0100565) < 4 & 
+                           as.numeric(genr.covar$F0100665) < 3 & 
+                           as.numeric(genr.covar$F0100765) < 3 & 
+                           as.numeric(genr.covar$F0101065) < 3 ~ 0)
+
+cts <- genr.covar[, c("IDC", cts.items)]
+colnames(cts) <- c("IDC", "shake", "shout", "call names", "threaten to slap", "pinch", "call stupid/lazy") 
+
+
+cts <- cts %>% 
+  gather(item, rating, -IDC) %>% 
+  mutate(rating = factor(rating, levels = c("Never", "Once", "2 times", "3 times", "4 times", "More than 4 times")))
+
+ggplot(cts, aes(x = as.factor(IDC), y = item, fill = rating)) + 
+  geom_tile() + 
+  scale_fill_brewer(type = "qual", palette = 3) + 
+  theme(text = element_text(size = 22))
+
+
+# table(cts.exposed)
+
+## prevalence for these are so high; generate a heatmap
+
+
+## for apq, code as exposed if answer sometimes or higher on one of the three measures above 
+apq.exposed <- case_when(as.numeric(genr.covar$D0203380_cleaned) >= 3 ~ 1, 
+                             as.numeric(genr.covar$D0203580_cleaned) >= 3 ~ 1,
+                             as.numeric(genr.covar$D0203880_cleaned) >= 4 ~ 1, 
+                             as.numeric(genr.covar$D0203380_cleaned) < 3 & 
+                               as.numeric(genr.covar$D0203580_cleaned) < 3 & 
+                                as.numeric(genr.covar$D0203880_cleaned) < 4 ~ 0)
+
+table(apq.exposed)
+
+## Definition: 
+genr.covar <- genr.covar %>% 
+  mutate(parcruel_3y = case_when(as.numeric(F0100465) >= 3 ~ 1,
+                         as.numeric(F0100965) >= 3 ~ 1, 
+                         # as.numeric(genr.covar$F0100565) >= 4 ~ 1, 
+                          as.numeric(F0100665) >= 4 ~ 1, 
+                          as.numeric(F0100765) >= 4 ~ 1, 
+                          as.numeric(F0101065) >= 4 ~ 1, 
+                         as.numeric(F0100465) < 3 & 
+                           as.numeric(F0100965) < 3 & 
+                            # as.numeric(genr.covar$F0100565) < 4 & 
+                           as.numeric(F0100665) < 4 & 
+                           as.numeric(F0100765) < 4 & 
+                           as.numeric(F0101065) < 4 ~ 0), 
+         parcruel_8y = case_when(as.numeric(D0203380_cleaned) >= 3 ~ 1, 
+                             as.numeric(D0203580_cleaned) >= 3 ~ 1,
+                             as.numeric(D0203880_cleaned) >= 4 ~ 1, 
+                             as.numeric(D0203380_cleaned) < 3 & 
+                               as.numeric(D0203580_cleaned) < 3 & 
+                                as.numeric(D0203880_cleaned) < 4 ~ 0))
+
+genr.covar$alt_parcruel_3y <- cts.exposed
+
+parcruel.vars <- c("parcruel_3y", "parcruel_8y")
+n.parcruel <- genr.covar %>%filter_at(vars(parcruel.vars), all_vars(!is.na(.))) %>% nrow(.) 
+
+
+print(paste0("Number of subjects with complete covariate data and caregiver physical or emotional abuse: ", n.parcruel))
+
+```
+
+### Sexual or physical abuse by anyone 
+
+Due to the low prevalence during earlier time periods, we collapse 0-5 and 6+ (early vs. late)
+
+```{r}
+
+## 1 = early, 2 = late, 0 = unexposed
+genr.covar <- genr.covar %>% mutate(abuse_r_10y = case_when(((le18 == "Yes" & le18age < 6) | 
+                                                               (le19 == "Yes" & le19age < 6) | 
+                                                               (le20 == "Yes" & le20age < 6) | 
+                                                               (le21 == "Yes" & le21age < 6))  ~ 1,
+                                                            ((le18 == "Yes" & le18age >= 6) | 
+                                                               (le19 == "Yes" & le19age >= 6) | 
+                                                               (le20 == "Yes" & le20age >= 6) | 
+                                                               (le21 == "Yes" & le21age >= 6))  ~ 2,
+                                                            ((le18 == "No") & 
+                                                               (le19 == "No") &
+                                                               (le20 == "No") & 
+                                                               (le21 == "No"))  ~ 0
+                                                            )) %>% 
+  mutate(abuse_early = case_when((abuse_r_10y == 1) ~ 1, (abuse_r_10y == 2 | abuse_r_10y == 0) ~ 0),
+         abuse_late = case_when((abuse_r_10y == 2) ~ 1, (abuse_r_10y == 1 | abuse_r_10y == 0) ~ 0)) 
+## dummy variables for early and late 
+
+n.abuse <- sum(!is.na(genr.covar$abuse_r_10y))
+print(paste0("Number of subjects with complete covariate data and sexual or physical abuse by anyone: ", n.abuse))
+
+
+```
+
+### Neighborhood disadvantage 
+
+```{r}
+## 1 = early, 2 = late, 0 = unexposed
+genr.covar <- genr.covar %>% mutate(nbhqual_r_10y = case_when((le9 == "Yes" & le9age < 6)  ~ 1,
+                                                             (le9 == "Yes" & le9age >= 6) ~ 2,
+                                                              (le9 == "No") ~ 0
+                                                            )) %>% 
+mutate(nbhqual_early = case_when((nbhqual_r_10y == 1) ~ 1, (nbhqual_r_10y == 2 | nbhqual_r_10y == 0) ~ 0),
+         nbhqual_late = case_when((nbhqual_r_10y == 2) ~ 1, (nbhqual_r_10y == 1 | nbhqual_r_10y == 0) ~ 0)) 
+
+n.nbhqual <- sum(!is.na(genr.covar$nbhqual_r_10y))
+print(paste0("Number of subjects with complete covariate data and neighborhood quality: ", n.nbhqual))
+
+
+```
+
+### Recoding family instability 
+
+Needs to recode these items because I just realized they actually coded people as NAs if they had been previously exposed, but the paper indicates that the exposure status should be carried over for subsequent time points. 
+
+```{r}
+
+load("genr.covar.Rdata")
+
+genr.covar <- genr.covar %>% 
+  mutate(faminst_3y =  case_when(separation_3yrs == "partner" ~ 0, 
+                                                separation_3yrs == "no partner" ~ 1), 
+                                    faminst_6y = 
+                                      case_when(separation_3_5yrs == "partner" ~ 0, 
+                                                separation_3_5yrs == "no partner" ~ 1, 
+                                                separation_3yrs == "no partner" ~ 1), 
+                                    faminst_10y = 
+                                      case_when(separation_5_9yrs == "partner" ~ 0, 
+                                                separation_5_9yrs == "no partner" ~ 1, 
+                                                separation_3_5yrs == "no partner" ~ 1, 
+                                                separation_3yrs == "no partner" ~ 1))
+
+faminst.vars <- c("faminst_3y", "faminst_6y", "faminst_10y")
+n.faminst <- genr.covar %>%filter_at(vars(faminst.vars), all_vars(!is.na(.))) %>% nrow(.)
+
+print(paste0("Number of subjects with complete covariate data and family instability (separation): ", n.faminst))
+
+# save(genr.covar, file = "genr.covar.Rdata")
+
+```
+
+
+
+
+## Part 2: Estimating the prevalence of the adversities 
+
+In part 1, we created the following five types of adversity: maternal psychopathology, financial hardship, one adult in the household, sexual or physical abuse by anyone, and neighborhood disadvantage. 
+
+In part 2, we generate the prevalence statistics within the subsample that had complete covariate data. 
+
+```{r}
+advers <- c("mompsych", "fscore", "oneadult", "faminst", "parcruel", "abuse", "nbhqual")
+advers.vars <- do.call("c", lapply(advers, function(x) grep(x, colnames(genr.covar), value = T)))
+
+## recode all adversity variables as factors 
+genr.covar[,advers.vars] <- lapply(advers.vars, function(x) as.factor(as.data.frame(genr.covar)[,x]))
+# lapply(genr.covar[,advers.vars], class)
+
+prevalence <- CreateCatTable(vars = advers.vars, data = genr.covar)
+print(prevalence)
+```
+
+
+## Part 3: correlations 
+
+In part 3, we make a correlation matrix to examine all bivariate associations among the exposure variables. 
+
+```{r, fig.width=20, fig.height=12}
+## keeping only the binary variables
+advers.vars <- advers.vars[!grepl("_r_", advers.vars )] ## removing the two that were polytomous 
+
+## run tetrachoric correlations 
+## need to convert back to numeric first 
+genr.covar[,advers.vars]  <- lapply(advers.vars, function(x) as.numeric(as.character(as.data.frame(genr.covar)[,x])))
+adver.cor <- polychoric(genr.covar[,advers.vars])
+corr.plot <- ggcorrplot(adver.cor$rho, 
+                        tl.cex = 9, 
+                        show.legend = TRUE, type = "lower", 
+           lab = TRUE, show.diag = FALSE) 
+corr.plot
+```
+
+```{r}
+
+## get rid of the two one adult 2m and 6m items because we just need the collapsed time point 
+# genr.covar <- genr.covar %>% select(-oneadult_2m, -oneadult_6m) 
+
+## save genr.covar 
+# save(genr.covar, file = "genr.covar.Rdata")
+```
+
+
+
+## Part 4: Distributions of internalizing and externalizing symptoms between exposed versus unexposed
+```{r, fig.width=15, fig.height=10}
+
+load("genr.covar.Rdata")
+## plot t-stat and CI comparing exposed vs. unexposed
+
+cbcls <- c("sum_int_9m", "sum_ext_9m", "cbcl_sum_9m")
+advers.vars <- do.call("c", lapply(advers, function(x) grep(x, colnames(genr.covar), value = T)))
+advers.vars <- advers.vars[!grepl("_r_", advers.vars)] ## get rid of the two retrospective ones
+
+
+ps <- lapply(cbcls, function(cbcl){
+  t.mat <- do.call(rbind, lapply(advers.vars, function(adver){
+  t.res <- t.test(genr.covar[[cbcl]] ~ genr.covar[[adver]])
+t.stat <- data.frame(t(c(adver, t.res$statistic, t.res$conf.int)))
+}))
+
+t.mat <- as.data.frame(t.mat)
+colnames(t.mat) <- c("exposure", "t.stat", "CI.lo", "CI.up")
+t.mat[,2:4] <- lapply(t.mat[, 2:4], function(x) as.numeric(as.character(x)))
+
+## plot 
+p <- ggplot(aes(x = exposure, y = t.stat), data = t.mat) + 
+  geom_point() + 
+  geom_errorbar(aes(ymin = CI.lo, ymax = CI.up), width = 0.4) + 
+  geom_hline(yintercept = 0, color = "red") + 
+  ggtitle(cbcl) + 
+  theme_bw()
+
+})
+
+
+do.call(grid.arrange, ps)
+
+```
+
+
+## Part 5: Correlations between accumulation and each adversity
+```{r, fig.width=15, fig.height=15}
+adver.list <- c("mompsych", "fscore", "oneadult", "faminst", "parcruel") 
+
+recency.vec.list <- list(c(3/12, 3, 10), 
+                         c(2, 3, 10),
+                         c(3/12, 6),
+                         c(3, 6, 10),
+                         c(3, 8))
+names(recency.vec.list) <- c("mompsych", "fscore", "oneadult", "faminst", "parcruel")   
+
+
+
+corplots <- lapply(adver.list, function(adver){
+df <- genr.covar
+exposures <- grep(paste0("^", adver), colnames(df), value = T)
+
+df <- df[complete.cases(df[,exposures]), ]
+
+
+recency.vec <- recency.vec.list[adver][[1]] ## do I need the last part? Double check
+
+
+exp <- do.call("cbind", lapply(df[, exposures], function(x) as.numeric(as.character(x))))
+df[,exposures] <- lapply(df[, exposures], function(x) as.numeric(as.character(x)))
+df$accumulation <- rowSums(exp)
+df$ever <- ifelse(df$accumulation > 0, 1, 0)
+df$recency <-  rowSums(exp %*% diag(recency.vec))
+# table(df$accumulation)
+# table(df$recency)
+
+# adver.cor <- polychoric(df[,c(exposures, "accumulation", "recency")]) ## empty cells in crosstab; cannot estimate polychoric correlation
+adver.cor <- cor(df[,c(exposures, "accumulation", "recency")], method = "spearman") ## instead let's just use spearman as an approximation for now
+
+
+corr.plot <- ggcorrplot(adver.cor, 
+                        tl.cex = 9, 
+                        show.legend = FALSE, type = "lower", 
+           lab = TRUE, show.diag = FALSE, title = adver) 
+})
+
+do.call(grid.arrange, corplots)
+
+
+
+```
+

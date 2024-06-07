@@ -1,0 +1,145 @@
+---
+title: "Total Effect estimates using SLCMA"
+author: "BJS"
+date: "3/25/2021"
+output: html_document
+---
+
+### Load libraries
+```{r load libs, echo=FALSE}
+library(dplyr)
+library(mice)
+library(lars)
+library(tidyr)
+library(knitr)
+library(selectiveInference)
+
+```
+
+### Load new df
+```{r load data}
+load("/data/js95/DunnLab/Brooke/Mediation/data/mediation_data_2021-06-03.Rdata")
+df$mom_age <- as.numeric(df$mom_age)
+
+```
+### Define recency vec
+```{r advers}
+recency.vec.list <- list(c(18, 30, 42, 57, 69, 81)/12, # measuring each in years, so divide by 12
+                          c(8, 21, 33, 61, 85)/12,
+                          c(8, 21, 33, 47, 85)/12,
+                          c(18, 30, 42, 57, 69, 81)/12,
+                          c(21, 33, 61, 85)/12,
+                          c(8, 21, 33, 47, 61, 73)/12,
+                          c(8, 21, 33, 61, 73)/12)
+names(recency.vec.list) <- c("abuse", "Fscore",  "oneadult", "r_faminst", "nbhqual","parc","mompsy")
+
+```
+### Define model inputs
+```{r inputs}
+adver = "Fscore"
+```
+
+### Complete case analysis
+
+```{r}
+
+# defining criteria for fn
+exposures <- grep(paste0("^", adver), names(df), value = T)
+covars = c("WHITE", "Female", "mom_age", "ppregnum","birthweight","sustained.smoke","ed_momgest")
+hypos = c("accumulation", "recency")
+outcome <- "SMFQ_10y"
+recency.vec = recency.vec.list[adver][[1]]
+step = 1 # step = 1 because only observing the first selected hypothesis
+
+# filter to CCs
+df <- df %>% filter(rowSums(is.na(.[,c(exposures,covars,outcome)])) == 0)
+
+# add accumulation, and recency 
+exp <- do.call("cbind", lapply(df[, exposures], function(x) as.numeric(as.character(x))))
+df <- df %>% 
+  mutate(accumulation = rowSums(exp)) %>% 
+  mutate(recency = rowSums(exp %*% diag(recency.vec)))
+
+  
+  ## select covariates -- 
+  ## what are the categorical covariates
+  cat.covars <- do.call("c", lapply(1:length(covars), function(x) {
+    cov1 <- covars[x]
+    if (is.factor(df[, cov1])) {
+      return(cov1)
+    } else {
+      return(NULL)
+    }
+  }))
+  
+## number of hypotheses 
+#n_hypo <- length(exposures) + length(hypos) # never needed in the fn
+
+cat.covariates <- model.matrix(as.formula(paste0("~", paste(cat.covars, collapse = "+"))), df)[,-1]
+covariates <- as.matrix(cbind(cat.covariates, as.matrix(df[,setdiff(covars, cat.covars)])))
+X_hypos <- do.call("cbind", lapply(df[, c(exposures, hypos)], function(x) as.numeric(as.character(x))))
+X_residual <- lm(X_hypos ~ covariates)$resid
+
+y <- df[, outcome]
+y <- as.numeric(as.character(y))
+
+## Frish-Waugh-Lovell - before lasso
+    y <- lm(y~covariates)$resid
+
+lasso <- lars(X_residual, y)
+    last.action <- length(lasso$actions)
+    variables <- numeric(last.action)
+    selection <- vector("list", last.action)
+
+    for(action in 1:last.action) {
+      variables[action] <- sum(lasso$beta[as.character(action), ] != 0)
+      selection[[action]] <- attributes(which(lasso$beta[as.character(action),
+                                                         ] != 0))$names
+    }
+
+    additions <- character(last.action)
+    for(action in 2:last.action) {
+      current_selection <- lasso$beta[as.character(action-1), ] != 0
+      new_selection <- lasso$beta[as.character(action), ] != 0
+      if(variables[action] > variables[action-1]) {
+        additions[action] <-
+          dimnames(X_residual)[[2]][new_selection != current_selection]
+      }
+    }
+
+    additions[1] <- selection[1]
+    
+    # Elbow plot
+  par(mar=c(5,4,4,5)+0.1)
+  plot(c(0, variables), lasso$R2, type='l', # lasso$R2 - this shows how elbow plots use R2
+     xlab="Variables selected", ylab="R-squared")
+  text(c(0, variables), rep(0, max(variables)+1),
+     labels=c("", additions), srt=90, adj=0)
+    
+
+# sI
+  sumsq <- lasso$normx
+  X_normed <- scale(X_residual, scale = sumsq)
+  
+  ## include more steps
+  fli <- fixedLassoInf(X_normed, y, lasso$beta[step+1,], lasso$lambda[step+1], alpha = 0.05)
+  scale <- sumsq[fli$vars]
+  fli$coef0 <- fli$coef0/scale
+  fli$sd <- fli$sd/scale
+  fli$ci <- fli$ci/cbind(scale,scale)
+  fli$vars <- names(fli$vars)
+  print("selectiveInference result:")
+  #print(fli)
+  fli.res <- as.data.frame(cbind(fli$vars, fli$coef0, fli$sd, fli$pv, fli$ci))
+  colnames(fli.res) <- c("Variable", "Beta", "SE", "Pvalue", "CI.lo", "CI.up")
+  
+  fli.res[,-1] <- lapply(fli.res[,-1], function(x) round(as.numeric(as.character(x)), 4))
+  
+  print(fli.res)
+  sI.res <- knitr::kable(fli.res)
+  print(knitr::kable(fli.res))
+  
+  print("p-value with more decimal points:")
+  print(fli$pv)    
+
+```
